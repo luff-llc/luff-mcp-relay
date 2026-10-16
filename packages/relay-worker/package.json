@@ -1,0 +1,46 @@
+{
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/luff-llc/luff-mcp-relay.git",
+    "directory": "packages/relay-worker"
+  },
+  "bugs": {
+    "url": "https://github.com/luff-llc/luff-mcp-relay/issues"
+  },
+  "homepage": "https://github.com/luff-llc/luff-mcp-relay#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "name": "luff-mcp-relay",
+  "version": "0.1.0-dev.0",
+  "description": "OAuth MCP relay with device tunnels, sealed forwarding and a Cloudflare Workers adapter, extracted from Marginalia.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE",
+    "wrangler.example.toml",
+    "LICENSE-APACHE-2.0.txt",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "scripts": {
+    "dev": "wrangler dev --ip 127.0.0.1 --port 8787",
+    "build": "wrangler types && tsc -p tsconfig.build.json && node ../../scripts/finalize-worker.mjs",
+    "typecheck": "wrangler types && tsc --noEmit -p tsconfig.json",
+    "test": "node --test src/index.test.js",
+    "prepack": "npm run build"
+  }
+}

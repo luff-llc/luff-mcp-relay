@@ -1,0 +1,28 @@
+{
+  "name": "luff-mcp-relay-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "test": "npm test --workspaces",
+    "build": "npm run build --workspace=luff-mcp-relay",
+    "typecheck": "npm run typecheck --workspace=luff-mcp-relay",
+    "dev": "npm run dev --workspace=luff-mcp-relay",
+    "verify:packages": "node scripts/verify-packages.mjs",
+    "verify:public": "node scripts/audit-public.mjs",
+    "check": "npm test && npm run build && npm run verify:packages && npm run verify:public",
+    "demo": "node scripts/demo.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.11",
+    "typescript": "5.8.3",
+    "wrangler": "4.151.0",
+    "ws": "8.22.0"
+  },
+  "license": "MIT"
+}

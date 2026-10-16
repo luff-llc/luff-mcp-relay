@@ -1,0 +1,31 @@
+name = "your-mcp-relay"
+main = "node_modules/luff-mcp-relay/dist/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+[vars]
+RELAY_ORIGIN = "https://your-mcp-relay.YOUR-SUBDOMAIN.workers.dev"
+
+[[durable_objects.bindings]]
+name = "TUNNELS"
+class_name = "Tunnel"
+
+[[durable_objects.bindings]]
+name = "GATEWAY"
+class_name = "Gateway"
+
+[[durable_objects.bindings]]
+name = "CODES"
+class_name = "Codes"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Tunnel"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Gateway"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["Codes"]

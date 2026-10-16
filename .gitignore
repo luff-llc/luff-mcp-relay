@@ -1,0 +1,13 @@
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+!.env.example
+**/dist/
+**/worker-configuration.d.ts
+artifacts/
+*.tgz
+.DS_Store
+**/wrangler.production.toml
