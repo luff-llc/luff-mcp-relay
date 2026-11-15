@@ -81,7 +81,7 @@ async function door(rig, { token, body = JSON.stringify(RPC), headers = {}, meth
   if (auth !== undefined) sent.authorization = auth;
   if (method === 'POST') sent['content-type'] ??= 'application/json';
   const request = new Request(`${ORIGIN}/door/mcp`, { method, headers: sent, body: method === 'POST' ? body : undefined });
-  return relay.handleDoor(request, rig.env, ORIGIN, relay.doorConfig(rig.env), rig.seams);
+  return relay.handleDoor(request, rig.env, ORIGIN, relay.doorConfig(rig.env, ORIGIN), rig.seams);
 }
 const goodToken = (rig, claims = {}) => sign(claims, {}, rig);
 const route = (env, path, init) => relay.default.fetch(new Request(`${ORIGIN}${path}`, init), env);
@@ -120,6 +120,12 @@ const offCases = {
   'upstream not a url': { DOOR_UPSTREAM_MCP: 'galley' },
   'a bad scope': { DOOR_SCOPES: 'ok bad/scope' },
   'too many scopes': { DOOR_SCOPES: 'a b c d e f g h i' },
+  'scopes as an array': { DOOR_SCOPES: ['a', 'b'] },
+  'a non-string issuer': { DOOR_ISSUER: 5 },
+  'a non-string jwks address': { DOOR_JWKS_URL: ['https://id.example/oauth/jwks'] },
+  'a non-string upstream': { DOOR_UPSTREAM_MCP: { href: UPSTREAM } },
+  'upstream with a query': { DOOR_UPSTREAM_MCP: `${UPSTREAM}?a=1` },
+  'upstream on the relay origin': { DOOR_UPSTREAM_MCP: `${ORIGIN}/mcp` },
 };
 for (const [name, change] of Object.entries(offCases)) {
   test(`door off: ${name}`, async () => {
@@ -131,6 +137,15 @@ for (const [name, change] of Object.entries(offCases)) {
     }
   });
 }
+
+test('a door misconfiguration cannot disturb another route', async () => {
+  for (const change of [{ DOOR_SCOPES: ['a'] }, { DOOR_ISSUER: 5 }, { DOOR_UPSTREAM_MCP: 7 }]) {
+    const { env } = makeRig(change);
+    const reply = await route(env, '/mcp', { method: 'POST', body: '{}' });
+    assert.equal(reply.status, 401);
+    assert.equal((await route(env, '/health')).status, 200);
+  }
+});
 
 test('door on: loopback http is allowed for all three addresses', async () => {
   const { env } = makeRig({ DOOR_ISSUER: 'http://localhost:9000', DOOR_JWKS_URL: 'http://localhost:9000/jwks', DOOR_UPSTREAM_MCP: 'http://127.0.0.1:9100/mcp' });
@@ -295,10 +310,19 @@ test('refused: a DPoP header is present', async () => {
 
 test('refused: a non-Bearer scheme, even with a good token', async () => {
   const rig = makeRig();
-  for (const authorization of [`Token ${await goodToken(rig)}`, `bearer ${await goodToken(rig)}`, 'Bearer', 'Bearer ']) {
+  for (const authorization of [`Token ${await goodToken(rig)}`, `Basic ${await goodToken(rig)}`, 'Bearer', 'Bearer ']) {
     assert.equal((await door(rig, { authorization })).status, 401, authorization);
   }
   assert.equal(rig.calls.upstream.length, 0);
+});
+
+test('the Bearer scheme is matched without regard to case, and the header travels unchanged', async () => {
+  const rig = makeRig();
+  for (const scheme of ['bearer', 'BEARER', 'bEaReR']) {
+    const authorization = `${scheme} ${await goodToken(rig)}`;
+    assert.equal((await door(rig, { authorization })).status, 200, scheme);
+    assert.equal(rig.calls.upstream.at(-1).init.headers.get('authorization'), authorization);
+  }
 });
 
 // MARK: keys
@@ -309,6 +333,17 @@ test('the key set is fetched once across several calls, and with the safe option
   assert.equal(rig.calls.jwks.length, 1);
   assert.equal(rig.calls.jwks[0].init.redirect, 'error');
   assert.ok(rig.calls.jwks[0].init.signal instanceof AbortSignal);
+});
+
+test('concurrent first calls each fetch for themselves and both succeed; later calls reuse the keys', async () => {
+  const rig = makeRig();
+  const tokens = [await goodToken(rig), await goodToken(rig)];
+  const replies = await Promise.all(tokens.map(token => door(rig, { token })));
+  assert.deepEqual(replies.map(reply => reply.status), [200, 200]);
+  assert.ok(rig.calls.jwks.length >= 1 && rig.calls.jwks.length <= 2);
+  const fetched = rig.calls.jwks.length;
+  assert.equal((await door(rig, { token: await goodToken(rig) })).status, 200);
+  assert.equal(rig.calls.jwks.length, fetched);
 });
 
 test('an unknown kid refetches at most once a minute', async () => {
@@ -461,6 +496,48 @@ test('a method outside the allowlist answers -32601 and is not forwarded', async
   assert.equal(rig.calls.upstream.length, 0);
 });
 
+test('a notification outside the allowlist answers 202 with no body and is not forwarded', async () => {
+  const rig = makeRig();
+  const reply = await door(rig, { token: await goodToken(rig), body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled' }) });
+  assert.equal(reply.status, 202);
+  assert.equal(await reply.text(), '');
+  assert.equal(rig.calls.upstream.length, 0);
+  const withNull = await door(rig, { token: await goodToken(rig), body: '{"jsonrpc":"2.0","id":null,"method":"resources/list"}' });
+  assert.equal(withNull.status, 200);
+});
+
+test('a client-sent JSON-RPC response is refused with 400', async () => {
+  const rig = makeRig();
+  const reply = await door(rig, { token: await goodToken(rig), body: '{"jsonrpc":"2.0","id":1,"result":{}}' });
+  assert.equal(reply.status, 400);
+  assert.equal(rig.calls.upstream.length, 0);
+});
+
+for (const [name, body] of [
+  ['a repeated method', '{"jsonrpc":"2.0","id":1,"method":"resources/read","method":"tools/list"}'],
+  ['a repeated method through a unicode escape', '{"jsonrpc":"2.0","id":1,"method":"resources/read","m\\u0065thod":"tools/list"}'],
+  ['a repeated id', '{"jsonrpc":"2.0","id":1,"method":"ping","id":2}'],
+  ['a repeated key after nested values', '{"jsonrpc":"2.0","method":"ping","params":{"a":[1,{"b":"}\\""}]},"id":1,"params":{}}'],
+]) {
+  test(`${name} is a 400 invalid_request and is not forwarded`, async () => {
+    const rig = makeRig();
+    const reply = await door(rig, { token: await goodToken(rig), body });
+    assert.equal(reply.status, 400);
+    assert.deepEqual(await reply.json(), { error: 'invalid_request' });
+    assert.equal(rig.calls.upstream.length, 0);
+  });
+}
+
+test('the same words inside strings and nested objects are not repeats, and the bytes go on unchanged', async () => {
+  const rig = makeRig();
+  const tricky = JSON.stringify('"method":"ping", \\ and "id":1');
+  const body = `{ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "x", "method": "a", "arguments": { "method": "b", "id": [1, {"method": 2}], "note": ${tricky} } }, "text": ${tricky} }`;
+  assert.doesNotThrow(() => JSON.parse(body));
+  const reply = await door(rig, { token: await goodToken(rig), body });
+  assert.equal(reply.status, 200);
+  assert.equal(Buffer.from(rig.calls.upstream[0].init.body).toString(), body);
+});
+
 test('every allowed method is forwarded', async () => {
   const rig = makeRig();
   const token = await goodToken(rig);
@@ -590,4 +667,61 @@ test('with the door on, /mcp and its metadata are exactly what they are with the
   assert.equal(library.status, 401);
   assert.match(library.headers.get('www-authenticate'), /resource_metadata="https:\/\/relay\.example\/\.well-known\/oauth-protected-resource\/mcp"/);
   assert.equal((await (await route(on.env, '/.well-known/oauth-protected-resource/mcp')).json()).resource, `${ORIGIN}/mcp`);
+});
+
+// MARK: the upstream address and the route
+
+test('a door misconfigured with a query or the relay itself stays off', () => {
+  const rig = makeRig();
+  assert.ok(relay.doorConfig(rig.env, ORIGIN));
+  assert.equal(relay.doorConfig({ ...rig.env, DOOR_UPSTREAM_MCP: `${UPSTREAM}?x=1` }, ORIGIN), null);
+  assert.equal(relay.doorConfig({ ...rig.env, DOOR_UPSTREAM_MCP: `${ORIGIN}/elsewhere` }, ORIGIN), null);
+  assert.equal(relay.doorConfig({ ...rig.env, DOOR_SCOPES: ['a'] }, ORIGIN), null);
+});
+
+test('the rate map is capped: a full map refuses new keys, and prunes at most once a minute', async () => {
+  const rig = makeRig();
+  const gateway = rig.env.GATEWAY.get('door');
+  const real = Date.now;
+  let at = real();
+  Date.now = () => at;
+  try {
+    for (let index = 0; index < 5000; index++) assert.equal(await gateway.admitDoor(`k${index}`, 10), true);
+    assert.equal(gateway.rates.size, 5000);
+    assert.equal(await gateway.admitDoor('new', 10), false);
+    assert.equal(gateway.rates.size, 5000);
+    assert.equal(await gateway.admitDoor('k1', 10), true);
+    // A new minute: stale entries go, and room returns.
+    at += 61_000;
+    assert.equal(await gateway.admitDoor('fresh', 10), true);
+    assert.equal(gateway.rates.size, 1);
+    // Refill within this minute; no second prune happens until the next minute.
+    for (let index = 0; index < 4999; index++) await gateway.admitDoor(`m${index}`, 10);
+    assert.equal(gateway.rates.size, 5000);
+    const iterations = { count: 0 };
+    const entries = gateway.rates.entries.bind(gateway.rates);
+    gateway.rates[Symbol.iterator] = () => { iterations.count++; return entries(); };
+    assert.equal(await gateway.admitDoor('over1', 10), false);
+    assert.equal(await gateway.admitDoor('over2', 10), false);
+    assert.equal(iterations.count, 0);
+  } finally { Date.now = real; }
+});
+
+test('through the router: a POST to /door/mcp with a good token reaches the upstream and returns its answer', async () => {
+  const rig = makeRig();
+  const token = await goodToken(rig);
+  const real = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url, init) => {
+    seen.push(String(url));
+    if (String(url) === JWKS) return jsonReply({ keys: [goodKey] });
+    if (String(url) === UPSTREAM) return jsonReply({ jsonrpc: '2.0', id: 1, result: { from: 'upstream' } });
+    throw new Error(`unexpected ${url}`);
+  };
+  try {
+    const reply = await route(rig.env, '/door/mcp', { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(RPC) });
+    assert.equal(reply.status, 200);
+    assert.deepEqual(await reply.json(), { jsonrpc: '2.0', id: 1, result: { from: 'upstream' } });
+    assert.deepEqual(seen, [JWKS, UPSTREAM]);
+  } finally { globalThis.fetch = real; }
 });

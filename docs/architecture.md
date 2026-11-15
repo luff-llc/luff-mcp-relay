@@ -64,6 +64,7 @@ answers coming back. The door holds no credential and stores nothing about the
 calls: no database writes, no logs. Only in-memory rate counters exist. The
 upstream gets the same `Authorization` header and decides what each tool may do;
 the door has no tool list of its own.
+The door does not forward client-sent JSON-RPC responses, so upstream elicitation and sampling are not available through it, and an upstream stream is cut at 30 seconds.
 
 ## Availability, revocation and retries
 

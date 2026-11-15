@@ -373,11 +373,14 @@ function doorURL(value: unknown, query: boolean): URL | null {
 }
 
 /// The door is on only when all three addresses are valid; anything else leaves it off.
-export function doorConfig(env: Env): DoorConfig | null {
-  const vars = env as unknown as Record<string, string | undefined>;
+export function doorConfig(env: Env, relay: string): DoorConfig | null {
+  const vars = env as unknown as Record<string, unknown>;
   const issuer = doorURL(vars.DOOR_ISSUER, false), jwks = doorURL(vars.DOOR_JWKS_URL, false), upstream = doorURL(vars.DOOR_UPSTREAM_MCP, true);
   if (!issuer || !jwks || !upstream || vars.DOOR_ISSUER !== issuer.origin || jwks.origin !== issuer.origin) return null;
+  // The upstream is one fixed address elsewhere: no query, and never this relay itself.
+  if (upstream.search || upstream.origin === new URL(relay).origin) return null;
   const raw = vars.DOOR_SCOPES;
+  if (raw !== undefined && typeof raw !== 'string') return null;
   const scopes = raw ? raw.split(' ') : [];
   if (scopes.length > 8 || scopes.some(scope => !/^[A-Za-z0-9:._-]{1,64}$/.test(scope))) return null;
   return { issuer: issuer.origin, jwks: jwks.href, upstream: upstream.href, scopes };
@@ -391,7 +394,7 @@ export function doorMetadata(origin: string, config: { issuer: string; scopes: s
 }
 
 // The identity service's signing keys, in memory only and keyed by their address.
-interface DoorKeys { url: string; keys: Map<string, CryptoKey> | null; at: number; attempt: number; inflight?: Promise<void> }
+interface DoorKeys { url: string; keys: Map<string, CryptoKey> | null; at: number; attempt: number; loading: number }
 let doorKeys: DoorKeys | null = null;
 export function resetDoorKeys(): void { doorKeys = null; }
 
@@ -431,14 +434,18 @@ async function loadDoorKeys(url: string, fetchImpl: typeof fetch): Promise<Map<s
 
 /// The key for `kid`: null when the service publishes no such key, 'unavailable' when no keys can be had.
 async function doorKey(url: string, kid: string, fetchImpl: typeof fetch, now: number): Promise<CryptoKey | null | 'unavailable'> {
-  if (!doorKeys || doorKeys.url !== url) doorKeys = { url, keys: null, at: 0, attempt: -Infinity };
+  if (!doorKeys || doorKeys.url !== url) doorKeys = { url, keys: null, at: 0, attempt: -Infinity, loading: 0 };
   const held = doorKeys;
   const fresh = held.keys !== null && now - held.at < DOOR_KEYS_FRESH_MS;
-  if (!held.inflight && (!fresh || !held.keys?.has(kid)) && now - held.attempt >= DOOR_REFETCH_MS) {
+  // Each request fetches for itself (another request's I/O is never awaited); the minute limit counts from the start.
+  // With no keys yet and a first fetch still under way, a second request fetches too, so a cold start refuses nobody.
+  if ((!fresh || !held.keys?.has(kid)) && (now - held.attempt >= DOOR_REFETCH_MS || (held.keys === null && held.loading > 0))) {
     held.attempt = now;
-    held.inflight = loadDoorKeys(url, fetchImpl).then(keys => { if (keys) { held.keys = keys; held.at = now; } }).finally(() => { held.inflight = undefined; });
+    held.loading++;
+    let keys: Map<string, CryptoKey> | null;
+    try { keys = await loadDoorKeys(url, fetchImpl); } finally { held.loading--; }
+    if (keys) { held.keys = keys; held.at = now; }
   }
-  if (held.inflight) await held.inflight;
   if (!held.keys || now - held.at >= DOOR_KEYS_FRESH_MS + DOOR_KEYS_GRACE_MS) return 'unavailable';
   return held.keys.get(kid) ?? null;
 }
@@ -479,6 +486,29 @@ async function doorVerify(token: string, config: DoorConfig, origin: string, fet
   return claims;
 }
 
+/// True when any top-level key of a body already known to be a JSON object appears twice (a key's escapes are decoded first).
+function doorRepeatsKey(text: string): boolean {
+  const seen = new Set<string>();
+  let depth = 0, wantKey = true;
+  for (let i = text.indexOf('{') + 1; i < text.length; i++) {
+    const char = text[i];
+    if (char === '"') {
+      let end = i + 1;
+      while (text[end] !== '"') end += text[end] === '\\' ? 2 : 1;
+      if (depth === 0 && wantKey) {
+        const key = JSON.parse(text.slice(i, end + 1)) as string;
+        if (seen.has(key)) return true;
+        seen.add(key);
+        wantKey = false;
+      }
+      i = end;
+    } else if (char === '{' || char === '[') depth++;
+    else if (char === '}' || char === ']') { if (--depth < 0) break; }
+    else if (char === ',' && depth === 0) wantKey = true;
+  }
+  return false;
+}
+
 /// The door's own answer where it cannot pass the call on: always HTTP 200 for a request with an id.
 function doorRefusal(message: { id?: unknown; method?: string }, code: string, text: string): Response {
   if (message.id === undefined) return new Response(null, { status: 202 });
@@ -506,7 +536,7 @@ export async function handleDoor(request: Request, env: Env, origin: string, con
         'www-authenticate': `Bearer resource_metadata="${origin}${DOOR_METADATA_PATH}"${scope}${authorization === null ? '' : ', error="invalid_token"'}` },
     }));
   };
-  const bearer = /^Bearer (.+)$/.exec(authorization ?? '');
+  const bearer = /^Bearer (.+)$/i.exec(authorization ?? '');
   if (!bearer || request.headers.has('dpop')) return refuseToken();
   const claims = await doorVerify(bearer[1], config, origin, fetchImpl, now);
   if (claims === 'unavailable') { leave(); return withCORS(error(503, 'door_unavailable', 'The door cannot check sign-ins right now. Try again shortly.')); }
@@ -521,10 +551,13 @@ export async function handleDoor(request: Request, env: Env, origin: string, con
   if (bytes === null) return withCORS(error(413, 'payload_too_large', 'Request too large.'));
   // The body is read only to look at it; the original bytes are what travel on.
   let message: { jsonrpc?: unknown; id?: unknown; method?: unknown };
-  try { message = JSON.parse(new TextDecoder().decode(bytes)); } catch { return withCORS(json(400, { error: 'invalid_request' })); }
-  if (!isPlain(message) || message.jsonrpc !== '2.0' || typeof message.method !== 'string') return withCORS(json(400, { error: 'invalid_request' }));
+  const text = new TextDecoder().decode(bytes);
+  try { message = JSON.parse(text); } catch { return withCORS(json(400, { error: 'invalid_request' })); }
+  // A key given twice could mean two things to two readers, so such a body is refused.
+  if (!isPlain(message) || message.jsonrpc !== '2.0' || typeof message.method !== 'string' || doorRepeatsKey(text)) return withCORS(json(400, { error: 'invalid_request' }));
   const call = { id: message.id, method: message.method };
   if (!DOOR_METHODS.includes(message.method)) {
+    if (!Object.hasOwn(message, 'id')) return withCORS(new Response(null, { status: 202 }));
     return withCORS(json(200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32601, message: 'This method is not available through the door.' } }));
   }
   const subscription = await (seams.subscription ?? doorSubscription)(claims);
@@ -566,9 +599,11 @@ export default {
     }
     // OAuth discovery for chat apps: public, and readable from browsers.
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
-    const door = doorConfig(env);
-    if (door && url.pathname === DOOR_METADATA_PATH) return withCORS(json(200, doorMetadata(origin, door)));
-    if (door && url.pathname === DOOR_PATH) return handleDoor(request, env, origin, door);
+    if (url.pathname === DOOR_METADATA_PATH || url.pathname === DOOR_PATH) {
+      const door = doorConfig(env, origin);
+      if (door && url.pathname === DOOR_METADATA_PATH) return withCORS(json(200, doorMetadata(origin, door)));
+      if (door) return handleDoor(request, env, origin, door);
+    }
     if (['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp'].includes(url.pathname)) {
       return withCORS(json(200, protectedResourceMetadata(origin)));
     }
@@ -1473,6 +1508,7 @@ export class Codes extends DurableObject<Env> {
 
 export class Gateway extends Tunnel {
   protected override universal = true;
+  private doorPruned = -1;
 
   /// Internal RPC: no body, device calls, or public route. Fetch validates again
   /// after admission so expiry/revocation between these steps cannot authorize it.
@@ -1486,7 +1522,12 @@ export class Gateway extends Tunnel {
   /// Internal RPC for the door: counts one call in memory (no body, no storage) and says whether it may go on.
   async admitDoor(key: string, limit: number): Promise<boolean> {
     const minute = Math.floor(Date.now() / 60_000);
-    if (this.rates.size > 5000) for (const [name, entry] of this.rates) if (entry.minute !== minute) this.rates.delete(name);
+    // Past the cap, old entries are dropped at most once a minute; if it is still full, a new key is refused.
+    if (this.rates.size >= 5000 && this.doorPruned !== minute) {
+      this.doorPruned = minute;
+      for (const [name, entry] of this.rates) if (entry.minute !== minute) this.rates.delete(name);
+    }
+    if (this.rates.size >= 5000 && !this.rates.has(key)) return false;
     return !this.limited(key, limit);
   }
 
