@@ -5,6 +5,11 @@ workers_dev = true
 
 [vars]
 RELAY_ORIGIN = "https://your-mcp-relay.YOUR-SUBDOMAIN.workers.dev"
+# The door (staging only, off unless all three are set): a pass-through MCP address at /door/mcp.
+# DOOR_ISSUER = "https://id.example.com"
+# DOOR_JWKS_URL = "https://id.example.com/oauth/jwks"
+# DOOR_UPSTREAM_MCP = "https://mcp.example.com/mcp"
+# DOOR_SCOPES = "projects:read"   # optional, space-separated
 
 [[durable_objects.bindings]]
 name = "TUNNELS"

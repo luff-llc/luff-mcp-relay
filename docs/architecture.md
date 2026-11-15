@@ -55,6 +55,16 @@ on both devices during short-code pairing. An operator that substitutes an
 unverified key can defeat the intended sealed-channel trust. Neither path claims
 zero knowledge. Durable Object storage is operated by the hosting provider.
 
+## The door
+
+On staging, the door (`/door/mcp`) passes a chat app's MCP calls to one configured
+upstream after checking the token that app holds from an external identity service.
+The operator can read those calls while they pass through, and the upstream's
+answers coming back. The door holds no credential and stores nothing about the
+calls: no database writes, no logs. Only in-memory rate counters exist. The
+upstream gets the same `Authorization` header and decides what each tool may do;
+the door has no tool list of its own.
+
 ## Availability, revocation and retries
 
 A device must stay connected to serve reads and OAuth. Mac sockets take precedence;
