@@ -11,3 +11,4 @@ artifacts/
 *.tgz
 .DS_Store
 **/wrangler.production.toml
+**/wrangler.staging.toml

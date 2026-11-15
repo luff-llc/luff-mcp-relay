@@ -73,6 +73,23 @@ It needs no secret and no storage. Keep the vars out of production config and ou
 of `wrangler.toml`; the sample lists them commented out. Metadata is at
 `/.well-known/oauth-protected-resource/door/mcp`.
 
+## A staging Worker from this repository
+
+Keep staging as its own Worker with its own name, origin and Durable Objects.
+Copy `packages/relay-worker/wrangler.toml` to `wrangler.staging.toml` beside it
+(ignored by Git), then set the Worker name, `RELAY_ORIGIN`, the route and, to turn
+the door on, the `DOOR_*` vars.
+
+When the Worker already exists and was deployed from another checkout, the new
+config must repeat its name, its three bindings and its migration tags exactly,
+and list every var and binding the old config had. A deploy replaces vars and
+bindings with what the config lists; secrets set with `wrangler secret put` stay.
+Compare first, without deploying:
+
+```sh
+npx wrangler deploy --dry-run --config packages/relay-worker/wrangler.staging.toml
+```
+
 ## Acceptance and operation
 
 Verify health/discovery at your origin, approve a synthetic device, connect the
