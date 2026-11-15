@@ -1,10 +1,10 @@
-name = "your-mcp-relay"
-main = "node_modules/luff-mcp-relay/dist/index.js"
+name = "your-ligature"
+main = "node_modules/@luff-llc/ligature/dist/index.js"
 compatibility_date = "2026-09-01"
 workers_dev = true
 
 [vars]
-RELAY_ORIGIN = "https://your-mcp-relay.YOUR-SUBDOMAIN.workers.dev"
+RELAY_ORIGIN = "https://your-ligature.YOUR-SUBDOMAIN.workers.dev"
 # The door (staging only, off unless all three are set): a pass-through MCP address at /door/mcp.
 # DOOR_ISSUER = "https://id.example.com"
 # DOOR_JWKS_URL = "https://id.example.com/oauth/jwks"

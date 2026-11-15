@@ -1,6 +1,7 @@
 # Provenance and attribution
 
 The initial source is extracted from Marginalia, not recreated as a new gateway.
+The project was first published as "LUFF MCP Relay" and is now named Ligature.
 
 - Source snapshot: `39248719908976354038e87819473da60f442b2f`.
 - Relay latest source commit: `8790a393dbf65e75a1d9d382c7db6568c470b84b`.

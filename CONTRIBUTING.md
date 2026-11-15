@@ -21,7 +21,7 @@ concrete integration. Tests need no production traffic or persistent credentials
    Record commit/evidence in release notes.
 3. Confirm npm names, maintainers, MIT attribution, version and runtime.
    `marginalia-connect` already exists; verify its npm owner before release.
-   `luff-mcp-relay` is a proposed package name.
+   `@luff-llc/ligature` is proposed, and the `@luff-llc` npm organisation does not exist yet.
 4. Inspect `artifacts/*.tgz`. A registry dry run is another preview; actual
    publishing needs separate release authorization.
 5. Tag a reviewed commit and publish manually or through a separately approved

@@ -26,7 +26,7 @@ selector nonce ordering, unbounded tunnel body-read time, non-HTTP loopback clie
 URLs and inherited Apple identity/default configuration. The original private
 checkout and its unrelated dirty work were left unchanged.
 
-Artifacts (not committed): `artifacts/luff-mcp-relay-0.1.0-dev.0.tgz`,
+Artifacts (not committed): `artifacts/luff-llc-ligature-0.1.0-dev.0.tgz`,
 `artifacts/marginalia-connect-0.4.0-dev.0.tgz`, JSON verification/audit reports,
 and `artifacts/SHA256SUMS`. npm publication has not occurred. The existing npm
 owner of `marginalia-connect` was verified as `mikelxc`; new versions still need

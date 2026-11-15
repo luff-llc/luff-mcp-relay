@@ -1,5 +1,5 @@
 {
-  "name": "luff-mcp-relay-workspace",
+  "name": "ligature-workspace",
   "private": true,
   "type": "module",
   "workspaces": [
@@ -10,9 +10,9 @@
   },
   "scripts": {
     "test": "npm test --workspaces",
-    "build": "npm run build --workspace=luff-mcp-relay",
-    "typecheck": "npm run typecheck --workspace=luff-mcp-relay",
-    "dev": "npm run dev --workspace=luff-mcp-relay",
+    "build": "npm run build --workspace=@luff-llc/ligature",
+    "typecheck": "npm run typecheck --workspace=@luff-llc/ligature",
+    "dev": "npm run dev --workspace=@luff-llc/ligature",
     "verify:packages": "node scripts/verify-packages.mjs",
     "verify:public": "node scripts/audit-public.mjs",
     "check": "npm test && npm run build && npm run verify:packages && npm run verify:public",

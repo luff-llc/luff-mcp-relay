@@ -21,7 +21,7 @@ const packages = [
     required: ['package.json', 'LICENSE', 'README.md', 'bin/marginalia-connect.mjs', 'index.mjs', 'index.d.mts', 'src/sealed.mjs', 'src/sealed.d.mts'],
   },
   {
-    name: 'luff-mcp-relay',
+    name: '@luff-llc/ligature',
     directory: path.join(root, 'packages/relay-worker'),
     allowed: new Set([
       'package.json', 'LICENSE', 'LICENSE-APACHE-2.0.txt', 'THIRD_PARTY_NOTICES.md', 'README.md',
@@ -137,9 +137,9 @@ const clientCtor: typeof client.SealedClient = client.SealedClient;
 const seal: typeof sealed.sealRequest = sealed.sealRequest;
 void [clientCtor, seal];
 `;
-  const workerTypes = `import type relay from 'luff-mcp-relay';
-import type { Tunnel, Gateway, Codes, normalizeCode } from 'luff-mcp-relay';
-import type { RelayEnv } from 'luff-mcp-relay';
+  const workerTypes = `import type relay from '@luff-llc/ligature';
+import type { Tunnel, Gateway, Codes, normalizeCode } from '@luff-llc/ligature';
+import type { RelayEnv } from '@luff-llc/ligature';
 
 type Worker = typeof relay;
 type DurableClasses = [typeof Tunnel, typeof Gateway, typeof Codes];

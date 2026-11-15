@@ -1,7 +1,11 @@
-# LUFF MCP Relay
+# Ligature
 
-An OAuth MCP relay for software that runs on a user's device. Extracted from
-Marginalia and developed in public by [LUFF](https://luff.works).
+Ligature is an OAuth MCP server for software that runs on a user's device. Extracted
+from Marginalia and developed in public by [LUFF](https://luff.works).
+
+Ligature has two addresses. The library relay (`/mcp`) passes requests to a device,
+which answers them. The door (`/door/mcp`) passes requests through to an MCP source,
+with sign-in by an outside identity service; it is staging only today.
 
 Connect a chat app through OAuth, or run a Node bridge that seals requests directly
 to a device. The device connects outward over WebSocket and remains responsible for
@@ -41,10 +45,10 @@ device and OAuth client journey.
 
 | Package | Purpose | Runtime |
 | --- | --- | --- |
-| [`luff-mcp-relay`](packages/relay-worker) | Worker handler, Tunnel, Gateway and Codes Durable Objects; deployment template | Cloudflare Workers |
+| [`@luff-llc/ligature`](packages/relay-worker) | Worker handler, Tunnel, Gateway and Codes Durable Objects; deployment template | Cloudflare Workers |
 | [`marginalia-connect`](packages/marginalia-connect) | Sealed Node API and CLI: pairing, stdio MCP, loopback proxy | Node 22.13+ |
 
-This repository prepares unpublished development versions: relay `0.1.0-dev.0`
+This repository prepares unpublished development versions: Worker `0.1.0-dev.0`
 and client `0.4.0-dev.0`. The existing `marginalia-connect@0.3.1` is a separate
 release. **No new npm release has been published from this repository.**
 
