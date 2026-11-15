@@ -331,32 +331,65 @@ test('the key set is fetched once across several calls, and with the safe option
   const rig = makeRig();
   for (let index = 0; index < 4; index++) assert.equal((await door(rig, { token: await goodToken(rig) })).status, 200);
   assert.equal(rig.calls.jwks.length, 1);
-  assert.equal(rig.calls.jwks[0].init.redirect, 'error');
+  assert.equal(rig.calls.jwks[0].init.redirect, 'manual');
   assert.ok(rig.calls.jwks[0].init.signal instanceof AbortSignal);
 });
 
-test('concurrent first calls each fetch for themselves and both succeed; later calls reuse the keys', async () => {
+test('concurrent cold-start calls each fetch for themselves and all succeed; later calls reuse the keys', async () => {
   const rig = makeRig();
-  const tokens = [await goodToken(rig), await goodToken(rig)];
+  const tokens = await Promise.all(Array.from({ length: 6 }, () => goodToken(rig)));
   const replies = await Promise.all(tokens.map(token => door(rig, { token })));
-  assert.deepEqual(replies.map(reply => reply.status), [200, 200]);
-  assert.ok(rig.calls.jwks.length >= 1 && rig.calls.jwks.length <= 2);
-  const fetched = rig.calls.jwks.length;
+  assert.deepEqual(replies.map(reply => reply.status), [200, 200, 200, 200, 200, 200]);
+  const fetches = rig.calls.jwks.length;
+  assert.ok(fetches >= 1 && fetches <= 6);
   assert.equal((await door(rig, { token: await goodToken(rig) })).status, 200);
-  assert.equal(rig.calls.jwks.length, fetched);
+  assert.equal(rig.calls.jwks.length, fetches);
 });
 
-test('an unknown kid refetches at most once a minute', async () => {
+test('a failed cold-start fetch answers 503 to every concurrent call', async () => {
+  const rig = makeRig();
+  rig.state.jwks = () => { throw new Error('down'); };
+  const tokens = await Promise.all([goodToken(rig), goodToken(rig), goodToken(rig)]);
+  const replies = await Promise.all(tokens.map(token => door(rig, { token })));
+  assert.deepEqual(replies.map(reply => reply.status), [503, 503, 503]);
+  assert.ok(rig.calls.jwks.length <= 3);
+});
+
+test('an unknown kid inside the 60 s window is a 503, not a 401; after a refetch it is a 401', async () => {
   const rig = makeRig();
   await door(rig, { token: await goodToken(rig) });
-  const stranger = await sign({}, { header: { kid: 'other' } }, rig);
-  assert.equal((await door(rig, { token: stranger })).status, 401);
+  const stranger = () => sign({}, { header: { kid: 'other' } }, rig);
+  const early = await door(rig, { token: await stranger() });
+  assert.equal(early.status, 503);
+  assert.equal((await early.json()).error.code, 'door_unavailable');
+  assert.equal(early.headers.get('www-authenticate'), null);
   assert.equal(rig.calls.jwks.length, 1);
   rig.clock.t += 61_000;
-  assert.equal((await door(rig, { token: await sign({}, { header: { kid: 'other' } }, rig) })).status, 401);
+  assert.equal((await door(rig, { token: await stranger() })).status, 401);
   assert.equal(rig.calls.jwks.length, 2);
-  assert.equal((await door(rig, { token: await sign({}, { header: { kid: 'other' } }, rig) })).status, 401);
+  assert.equal((await door(rig, { token: await stranger() })).status, 503);
   assert.equal(rig.calls.jwks.length, 2);
+});
+
+test('a key rotated in just after another unknown-kid refetch is a 503 until the window passes', async () => {
+  const rig = makeRig();
+  await door(rig, { token: await goodToken(rig) });
+  rig.clock.t += 61_000;
+  assert.equal((await door(rig, { token: await sign({}, { header: { kid: 'other' } }, rig) })).status, 401);
+  rig.state.jwks = () => jsonReply({ keys: [goodKey, { ...goodKey, kid: 'k2' }] });
+  assert.equal((await door(rig, { token: await sign({}, { header: { kid: 'k2' } }, rig) })).status, 503);
+  rig.clock.t += 61_000;
+  assert.equal((await door(rig, { token: await sign({}, { header: { kid: 'k2' } }, rig) })).status, 200);
+});
+
+test('a 302 from the key address loads no keys and is not followed', async () => {
+  const rig = makeRig();
+  rig.state.jwks = () => new Response(null, { status: 302, headers: { location: 'https://evil.example/keys', 'content-type': 'application/json' } });
+  const reply = await door(rig, { token: await goodToken(rig) });
+  assert.equal(reply.status, 503);
+  assert.equal(rig.calls.jwks.length, 1);
+  assert.equal(rig.calls.jwks[0].init.redirect, 'manual');
+  assert.equal(rig.calls.upstream.length, 0);
 });
 
 test('a rotated-in key is picked up on the refetch', async () => {
@@ -565,6 +598,24 @@ for (const [name, body] of [['a batch', '[{"jsonrpc":"2.0","id":1,"method":"ping
   });
 }
 
+test('a body that is not valid UTF-8 is a 400 invalid_request and is not forwarded', async () => {
+  const rig = makeRig();
+  const body = Buffer.concat([Buffer.from('{"jsonrpc":"2.0","id":1,"method":"ping","x":"'), Buffer.from([0xff, 0xfe]), Buffer.from('"}')]);
+  const reply = await door(rig, { token: await goodToken(rig), body });
+  assert.equal(reply.status, 400);
+  assert.deepEqual(await reply.json(), { error: 'invalid_request' });
+  assert.equal(rig.calls.upstream.length, 0);
+});
+
+test('a body with a leading byte-order mark is a 400 invalid_request and is not forwarded', async () => {
+  const rig = makeRig();
+  const body = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('{"jsonrpc":"2.0","id":1,"method":"ping"}')]);
+  const reply = await door(rig, { token: await goodToken(rig), body });
+  assert.equal(reply.status, 400);
+  assert.deepEqual(await reply.json(), { error: 'invalid_request' });
+  assert.equal(rig.calls.upstream.length, 0);
+});
+
 // MARK: limits
 
 test('a body over 2 MB is a 413 and is not forwarded', async () => {
@@ -679,7 +730,7 @@ test('a door misconfigured with a query or the relay itself stays off', () => {
   assert.equal(relay.doorConfig({ ...rig.env, DOOR_SCOPES: ['a'] }, ORIGIN), null);
 });
 
-test('the rate map is capped: a full map refuses new keys, and prunes at most once a minute', async () => {
+test('the rate map is capped: a full map evicts to admit a new key, and the earlier-minute scan runs at most once a minute', async () => {
   const rig = makeRig();
   const gateway = rig.env.GATEWAY.get('door');
   const real = Date.now;
@@ -688,23 +739,61 @@ test('the rate map is capped: a full map refuses new keys, and prunes at most on
   try {
     for (let index = 0; index < 5000; index++) assert.equal(await gateway.admitDoor(`k${index}`, 10), true);
     assert.equal(gateway.rates.size, 5000);
-    assert.equal(await gateway.admitDoor('new', 10), false);
+    assert.equal(await gateway.admitDoor('new', 10), true);
     assert.equal(gateway.rates.size, 5000);
+    assert.equal(gateway.rates.has('new'), true);
+    // The oldest-inserted entry went; a key still held keeps counting.
+    assert.equal(gateway.rates.has('k0'), false);
+    assert.equal(gateway.rates.has('k1'), true);
     assert.equal(await gateway.admitDoor('k1', 10), true);
     // A new minute: stale entries go, and room returns.
     at += 61_000;
     assert.equal(await gateway.admitDoor('fresh', 10), true);
-    assert.equal(gateway.rates.size, 1);
-    // Refill within this minute; no second prune happens until the next minute.
-    for (let index = 0; index < 4999; index++) await gateway.admitDoor(`m${index}`, 10);
-    assert.equal(gateway.rates.size, 5000);
+    for (let index = 0; index < 5000; index++) assert.equal(await gateway.admitDoor(`m${index}`, 10), true);
+    assert.ok(gateway.rates.size <= 5000);
+    assert.equal(gateway.rates.has('fresh'), false);
+    // Within this minute no second scan of the whole map happens.
     const iterations = { count: 0 };
     const entries = gateway.rates.entries.bind(gateway.rates);
     gateway.rates[Symbol.iterator] = () => { iterations.count++; return entries(); };
-    assert.equal(await gateway.admitDoor('over1', 10), false);
-    assert.equal(await gateway.admitDoor('over2', 10), false);
+    assert.equal(await gateway.admitDoor('over1', 10), true);
+    assert.equal(await gateway.admitDoor('over2', 10), true);
     assert.equal(iterations.count, 0);
+    assert.ok(gateway.rates.size <= 5000);
   } finally { Date.now = real; }
+});
+
+test('a flood of distinct addresses cannot lock out a new one', async () => {
+  const rig = makeRig();
+  const gateway = rig.env.GATEWAY.get('door');
+  for (let index = 0; index < 6000; index++) await gateway.admitDoor(`address:v4-${index}`, 120);
+  assert.ok(gateway.rates.size <= 5000);
+  assert.equal((await door(rig, { headers: { 'cf-connecting-ip': '198.51.100.7' } })).status, 401);
+});
+
+test('IPv6 addresses are counted per /64', async () => {
+  const rig = makeRig();
+  const status = ip => door(rig, { headers: { 'cf-connecting-ip': ip } }).then(reply => reply.status);
+  for (let index = 0; index < 120; index++) assert.equal(await status(`2001:db8:1:2:${index.toString(16)}::1`), 401);
+  assert.equal(await status('2001:0db8:0001:0002:ffff:ffff:ffff:ffff'), 429);
+  assert.equal(await status('2001:db8:1:2::'), 429);
+  assert.equal(await status('2001:db8:1:3::1'), 401);
+  assert.equal(await status('2001:db8:1::1'), 401);
+  // IPv4 is unchanged: one counter per address.
+  for (let index = 0; index < 120; index++) assert.equal(await status('203.0.113.9'), 401);
+  assert.equal(await status('203.0.113.9'), 429);
+  assert.equal(await status('203.0.113.10'), 401);
+  const keys = [...rig.env.GATEWAY.get('door').rates.keys()].filter(key => key.startsWith('address:'));
+  assert.ok(keys.includes('address:2001:db8:1:2::/64'));
+  assert.ok(keys.includes('address:2001:db8:1:0::/64'));
+});
+
+test('an address that does not parse is counted as it is', async () => {
+  const rig = makeRig();
+  const gateway = rig.env.GATEWAY.get('door');
+  for (const ip of ['unknown', 'a::b::c', '1:2:3', 'zz::1', '::ffff:192.0.2.1']) await door(rig, { headers: { 'cf-connecting-ip': ip } });
+  const keys = [...gateway.rates.keys()];
+  for (const ip of ['unknown', 'a::b::c', '1:2:3', 'zz::1', '::ffff:192.0.2.1']) assert.ok(keys.includes(`address:${ip}`), ip);
 });
 
 test('through the router: a POST to /door/mcp with a good token reaches the upstream and returns its answer', async () => {
