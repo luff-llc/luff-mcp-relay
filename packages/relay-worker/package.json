@@ -17,9 +17,9 @@
     "access": "public"
   },
   "sideEffects": false,
-  "name": "luff-mcp-relay",
+  "name": "@luff-llc/ligature",
   "version": "0.1.0-dev.0",
-  "description": "OAuth MCP relay with device tunnels, sealed forwarding and a Cloudflare Workers adapter, extracted from Marginalia.",
+  "description": "Ligature: an OAuth MCP relay for device libraries and a pass-through door for MCP sources, on Cloudflare Workers. Extracted from Marginalia.",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {

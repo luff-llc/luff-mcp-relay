@@ -1,6 +1,6 @@
-# luff-mcp-relay
+# @luff-llc/ligature
 
-Cloudflare Workers deployment of the LUFF OAuth MCP relay, extracted from
+Cloudflare Workers deployment of Ligature (the library relay and the door), extracted from
 Marginalia. Developer preview `0.1.0-dev.0`; no npm release from this repository yet.
 
 Exports the default Worker handler and `Tunnel`, `Gateway`, `Codes` Durable Object
@@ -8,7 +8,7 @@ classes, plus metadata and sealed-channel helpers. `RelayEnv` describes the host
 bindings. Import only in a Workers runtime. Node applications use `marginalia-connect`.
 
 ```ts
-export { default, Tunnel, Gateway, Codes } from 'luff-mcp-relay';
+export { default, Tunnel, Gateway, Codes } from '@luff-llc/ligature';
 ```
 
 Build and test from the repository root:

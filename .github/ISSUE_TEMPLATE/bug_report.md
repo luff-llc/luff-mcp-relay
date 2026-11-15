@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: A reproducible relay or client problem
+about: A reproducible library relay, door or client problem
 ---
 
 Describe expected/actual behavior, package/runtime/client versions and a minimal

@@ -1,4 +1,4 @@
-# Deploy your own relay
+# Deploy your own Ligature
 
 Local work needs no Cloudflare login. Production needs your own Workers account
 and Durable Objects support. This cut has no Node server or Docker adapter.
@@ -36,13 +36,13 @@ Repository versions are currently unpublished. Build verified artifacts first:
 npm run verify:packages
 # In a separate Worker project:
 npm init -y
-npm install /path/to/luff-mcp-relay-0.1.0-dev.0.tgz
-cp node_modules/luff-mcp-relay/wrangler.example.toml wrangler.toml
+npm install /path/to/luff-llc-ligature-0.1.0-dev.0.tgz
+cp node_modules/@luff-llc/ligature/wrangler.example.toml wrangler.toml
 ```
 
 Install compatible Wrangler locally (this repository pins `4.151.0`), update
 the sample name/origin and run `npx wrangler deploy --dry-run`. The template loads
-`node_modules/luff-mcp-relay/dist/index.js`. You may instead re-export the
+`node_modules/@luff-llc/ligature/dist/index.js`. You may instead re-export the
 handler/classes from your Worker module. No private checkout is required.
 
 ## Optional adapters
@@ -72,6 +72,23 @@ valid:
 It needs no secret and no storage. Keep the vars out of production config and out
 of `wrangler.toml`; the sample lists them commented out. Metadata is at
 `/.well-known/oauth-protected-resource/door/mcp`.
+
+## A staging Worker from this repository
+
+Keep staging as its own Worker with its own name, origin and Durable Objects.
+Copy `packages/relay-worker/wrangler.toml` to `wrangler.staging.toml` beside it
+(ignored by Git), then set the Worker name, `RELAY_ORIGIN`, the route and, to turn
+the door on, the `DOOR_*` vars.
+
+When the Worker already exists and was deployed from another checkout, the new
+config must repeat its name, its three bindings and its migration tags exactly,
+and list every var and binding the old config had. A deploy replaces vars and
+bindings with what the config lists; secrets set with `wrangler secret put` stay.
+Compare first, without deploying:
+
+```sh
+npx wrangler deploy --dry-run --config packages/relay-worker/wrangler.staging.toml
+```
 
 ## Acceptance and operation
 
