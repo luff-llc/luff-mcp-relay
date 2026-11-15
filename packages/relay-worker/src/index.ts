@@ -333,6 +333,251 @@ export function marginaliaRelayPage(origin: string): Response {
 <p class="note">Remove any agent in Marginalia's Agents. <a href="https://luff.works/marginalia/privacy">Privacy</a> · <a href="https://luff.works/marginalia/support">Support</a></p>`);
 }
 
+// MARK: The door
+
+// A pass-through MCP address for a chat app that holds a token from an external identity
+// service. The door checks the token, forwards the body to one configured upstream with the
+// same Authorization header, and returns the upstream's answer unchanged. It holds no
+// credential, stores nothing about these calls and logs nothing. Public vars only.
+const DOOR_PATH = '/door/mcp';
+const DOOR_METADATA_PATH = '/.well-known/oauth-protected-resource/door/mcp';
+const DOOR_METHODS = ['initialize', 'ping', 'notifications/initialized', 'tools/list', 'tools/call'];
+const DOOR_TOKEN_MAX = 16_384;
+const DOOR_JWKS_MAX = 65_536;
+const DOOR_KEYS_FRESH_MS = 10 * 60_000;
+const DOOR_KEYS_GRACE_MS = 3600_000;
+const DOOR_REFETCH_MS = 60_000;
+const DOOR_JWKS_TIMEOUT_MS = 5_000;
+const DOOR_FORWARDED = ['authorization', 'content-type', 'accept', 'mcp-session-id', 'mcp-protocol-version'];
+const DOOR_RETURNED = ['content-type', 'www-authenticate', 'mcp-session-id', 'cache-control', 'retry-after'];
+
+export interface DoorConfig { issuer: string; jwks: string; upstream: string; scopes: string[] }
+export interface DoorSeams {
+  fetchImpl?: typeof fetch;
+  subscription?: (claims: Record<string, unknown>) => Promise<{ ok: true } | { ok: false; message: string }>;
+  now?: () => number;
+}
+
+/// Where a chat person's subscription would be checked. Today every verified caller passes.
+export async function doorSubscription(_claims: Record<string, unknown>): Promise<{ ok: true } | { ok: false; message: string }> {
+  return { ok: true };
+}
+
+function doorURL(value: unknown, query: boolean): URL | null {
+  if (typeof value !== 'string' || value.includes('#') || (!query && value.includes('?'))) return null;
+  try {
+    const url = new URL(value);
+    const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+    return (url.protocol === 'https:' || (url.protocol === 'http:' && loopback)) && !url.username && !url.password ? url : null;
+  } catch { return null; }
+}
+
+/// The door is on only when all three addresses are valid; anything else leaves it off.
+export function doorConfig(env: Env, relay: string): DoorConfig | null {
+  const vars = env as unknown as Record<string, unknown>;
+  const issuer = doorURL(vars.DOOR_ISSUER, false), jwks = doorURL(vars.DOOR_JWKS_URL, false), upstream = doorURL(vars.DOOR_UPSTREAM_MCP, true);
+  if (!issuer || !jwks || !upstream || vars.DOOR_ISSUER !== issuer.origin || jwks.origin !== issuer.origin) return null;
+  // The upstream is one fixed address elsewhere: no query, and never this relay itself.
+  if (upstream.search || upstream.origin === new URL(relay).origin) return null;
+  const raw = vars.DOOR_SCOPES;
+  if (raw !== undefined && typeof raw !== 'string') return null;
+  const scopes = raw ? raw.split(' ') : [];
+  if (scopes.length > 8 || scopes.some(scope => !/^[A-Za-z0-9:._-]{1,64}$/.test(scope))) return null;
+  return { issuer: issuer.origin, jwks: jwks.href, upstream: upstream.href, scopes };
+}
+
+export function doorMetadata(origin: string, config: { issuer: string; scopes: string[] }) {
+  return {
+    resource: `${origin}${DOOR_PATH}`, authorization_servers: [config.issuer], bearer_methods_supported: ['header'],
+    ...(config.scopes.length ? { scopes_supported: config.scopes } : {}), resource_name: 'The door',
+  };
+}
+
+// The identity service's signing keys, in memory only and keyed by their address.
+interface DoorKeys { url: string; keys: Map<string, CryptoKey> | null; at: number; attempt: number; loading: number }
+let doorKeys: DoorKeys | null = null;
+export function resetDoorKeys(): void { doorKeys = null; }
+
+async function loadDoorKeys(url: string, fetchImpl: typeof fetch): Promise<Map<string, CryptoKey> | null> {
+  try {
+    const response = await fetchImpl(url, { redirect: 'error', signal: AbortSignal.timeout(DOOR_JWKS_TIMEOUT_MS), headers: { accept: 'application/json' } });
+    if (response.status !== 200 || !/^application\/(?:[\w.+-]+\+)?json\s*(?:;|$)/i.test(response.headers.get('content-type') ?? '')
+      || Number(response.headers.get('content-length') ?? '0') > DOOR_JWKS_MAX) { void response.body?.cancel().catch(() => {}); return null; }
+    const reader = response.body?.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    for (;;) {
+      const { value, done } = reader ? await reader.read() : { value: undefined, done: true };
+      if (done) break;
+      size += value.byteLength;
+      if (size > DOOR_JWKS_MAX) { void reader?.cancel().catch(() => {}); return null; }
+      chunks.push(value);
+    }
+    const set = JSON.parse(new TextDecoder().decode(concat(...chunks))) as { keys?: Record<string, unknown>[] };
+    if (!Array.isArray(set?.keys) || set.keys.length < 1 || set.keys.length > 8) return null;
+    const found = new Map<string, CryptoKey>();
+    const repeated = new Set<string>();
+    for (const jwk of set.keys) {
+      if (!jwk || typeof jwk !== 'object' || jwk.kty !== 'EC' || jwk.crv !== 'P-256' || typeof jwk.x !== 'string' || typeof jwk.y !== 'string'
+        || typeof jwk.kid !== 'string' || !jwk.kid || (jwk.alg !== undefined && jwk.alg !== 'ES256') || (jwk.use !== undefined && jwk.use !== 'sig') || 'd' in jwk) continue;
+      if (found.has(jwk.kid)) repeated.add(jwk.kid);
+      try {
+        found.set(jwk.kid, await crypto.subtle.importKey('jwk', { kty: 'EC', crv: 'P-256', x: jwk.x, y: jwk.y },
+          { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']));
+      } catch { /* An unusable key is skipped. */ }
+    }
+    // A key id published twice is ambiguous; neither copy is trusted.
+    for (const kid of repeated) found.delete(kid);
+    return found.size ? found : null;
+  } catch { return null; }
+}
+
+/// The key for `kid`: null when the service publishes no such key, 'unavailable' when no keys can be had.
+async function doorKey(url: string, kid: string, fetchImpl: typeof fetch, now: number): Promise<CryptoKey | null | 'unavailable'> {
+  if (!doorKeys || doorKeys.url !== url) doorKeys = { url, keys: null, at: 0, attempt: -Infinity, loading: 0 };
+  const held = doorKeys;
+  const fresh = held.keys !== null && now - held.at < DOOR_KEYS_FRESH_MS;
+  // Each request fetches for itself (another request's I/O is never awaited); the minute limit counts from the start.
+  // With no keys yet and a first fetch still under way, a second request fetches too, so a cold start refuses nobody.
+  if ((!fresh || !held.keys?.has(kid)) && (now - held.attempt >= DOOR_REFETCH_MS || (held.keys === null && held.loading > 0))) {
+    held.attempt = now;
+    held.loading++;
+    let keys: Map<string, CryptoKey> | null;
+    try { keys = await loadDoorKeys(url, fetchImpl); } finally { held.loading--; }
+    if (keys) { held.keys = keys; held.at = now; }
+  }
+  if (!held.keys || now - held.at >= DOOR_KEYS_FRESH_MS + DOOR_KEYS_GRACE_MS) return 'unavailable';
+  return held.keys.get(kid) ?? null;
+}
+
+const isPlain = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
+function doorJSON(part: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(fromBase64url(part)));
+    return isPlain(value) ? value : null;
+  } catch { return null; }
+}
+
+/// A verified chat connection's claims, null for any refusal, or 'unavailable' when no keys can be had.
+async function doorVerify(token: string, config: DoorConfig, origin: string, fetchImpl: typeof fetch, now: number): Promise<Record<string, unknown> | null | 'unavailable'> {
+  if (token.length > DOOR_TOKEN_MAX) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3 || parts.some(part => !/^[A-Za-z0-9_-]+$/.test(part))) return null;
+  const header = doorJSON(parts[0]);
+  if (!header || Object.keys(header).sort().join() !== 'alg,kid,typ' || header.alg !== 'ES256' || header.typ !== 'at+jwt'
+    || typeof header.kid !== 'string' || header.kid.length < 1 || header.kid.length > 128) return null;
+  let signature: Uint8Array;
+  try { signature = fromBase64url(parts[2]); } catch { return null; }
+  if (signature.length !== 64) return null;
+  const key = await doorKey(config.jwks, header.kid, fetchImpl, now);
+  if (!key || key === 'unavailable') return key;
+  if (!await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, signature, encoder.encode(`${parts[0]}.${parts[1]}`))) return null;
+  const claims = doorJSON(parts[1]);
+  if (!claims) return null;
+  const seconds = Math.floor(now / 1000);
+  const whole = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+  const { act, amr } = claims;
+  if (claims.iss !== config.issuer || claims.aud !== `${origin}${DOOR_PATH}` || !whole(claims.exp) || !whole(claims.iat)
+    || claims.exp <= seconds || claims.iat > seconds + 60 || (claims.nbf !== undefined && (!whole(claims.nbf) || claims.nbf > seconds + 60))
+    || typeof claims.sub !== 'string' || !claims.sub
+    || !Array.isArray(amr) || amr.length !== 1 || amr[0] !== 'hosted_oauth'
+    || !isPlain(act) || Object.keys(act).join() !== 'sub' || typeof act.sub !== 'string' || !act.sub
+    || Object.hasOwn(claims, 'cnf') || (Object.hasOwn(claims, 'luff_binding') && claims.luff_binding !== 'hosted_bearer')) return null;
+  return claims;
+}
+
+/// True when any top-level key of a body already known to be a JSON object appears twice (a key's escapes are decoded first).
+function doorRepeatsKey(text: string): boolean {
+  const seen = new Set<string>();
+  let depth = 0, wantKey = true;
+  for (let i = text.indexOf('{') + 1; i < text.length; i++) {
+    const char = text[i];
+    if (char === '"') {
+      let end = i + 1;
+      while (text[end] !== '"') end += text[end] === '\\' ? 2 : 1;
+      if (depth === 0 && wantKey) {
+        const key = JSON.parse(text.slice(i, end + 1)) as string;
+        if (seen.has(key)) return true;
+        seen.add(key);
+        wantKey = false;
+      }
+      i = end;
+    } else if (char === '{' || char === '[') depth++;
+    else if (char === '}' || char === ']') { if (--depth < 0) break; }
+    else if (char === ',' && depth === 0) wantKey = true;
+  }
+  return false;
+}
+
+/// The door's own answer where it cannot pass the call on: always HTTP 200 for a request with an id.
+function doorRefusal(message: { id?: unknown; method?: string }, code: string, text: string): Response {
+  if (message.id === undefined) return new Response(null, { status: 202 });
+  if (message.method === 'tools/call') {
+    return json(200, { jsonrpc: '2.0', id: message.id, result: { isError: true, content: [{ type: 'text', text }], structuredContent: { code, message: text } } });
+  }
+  return json(200, { jsonrpc: '2.0', id: message.id, error: { code: -32000, message: text, data: { code } } });
+}
+
+export async function handleDoor(request: Request, env: Env, origin: string, config: DoorConfig, seams: DoorSeams = {}): Promise<Response> {
+  const fetchImpl = seams.fetchImpl ?? fetch;
+  const now = (seams.now ?? Date.now)();
+  const leave = () => { void request.body?.cancel().catch(() => {}); };
+  if (request.method !== 'POST') return withCORS(new Response(null, { status: 405, headers: { allow: 'POST, OPTIONS' } }));
+  // The rate-limit instance is separate from the library's, and only counts in memory.
+  const limiter = env.GATEWAY.get(env.GATEWAY.idFromName('door'));
+  const tooMany = () => { leave(); return withCORS(error(429, 'rate_limited', 'Too many requests; wait a minute.')); };
+  if (!await limiter.admitDoor(`address:${request.headers.get('cf-connecting-ip') ?? 'unknown'}`, ADDRESS_PER_MINUTE)) return tooMany();
+  const authorization = request.headers.get('authorization');
+  const refuseToken = () => {
+    leave();
+    const scope = config.scopes.length ? `, scope="${config.scopes.join(' ')}"` : '';
+    return withCORS(new Response(JSON.stringify({ error: 'invalid_token', error_description: 'Sign in again to use this connection.' }), {
+      status: 401, headers: { 'content-type': 'application/json', 'cache-control': 'no-store',
+        'www-authenticate': `Bearer resource_metadata="${origin}${DOOR_METADATA_PATH}"${scope}${authorization === null ? '' : ', error="invalid_token"'}` },
+    }));
+  };
+  const bearer = /^Bearer (.+)$/i.exec(authorization ?? '');
+  if (!bearer || request.headers.has('dpop')) return refuseToken();
+  const claims = await doorVerify(bearer[1], config, origin, fetchImpl, now);
+  if (claims === 'unavailable') { leave(); return withCORS(error(503, 'door_unavailable', 'The door cannot check sign-ins right now. Try again shortly.')); }
+  if (!claims) return refuseToken();
+  const caller = await sha256(`${(claims.act as { sub: string }).sub}\n${claims.sub as string}`);
+  if (!await limiter.admitDoor(`caller:${caller}`, TUNNEL_PER_MINUTE)) return tooMany();
+  const declared = Number(request.headers.get('content-length') ?? '0');
+  if (!Number.isSafeInteger(declared) || declared < 0) { leave(); return withCORS(error(400, 'invalid_length', 'Invalid Content-Length.')); }
+  if (declared > MAX_BODY) { leave(); return withCORS(error(413, 'payload_too_large', 'Request too large.')); }
+  const bytes = await boundedBytes(request);
+  if (bytes === undefined) return withCORS(error(408, 'request_timeout', 'The request body did not arrive in time.'));
+  if (bytes === null) return withCORS(error(413, 'payload_too_large', 'Request too large.'));
+  // The body is read only to look at it; the original bytes are what travel on.
+  let message: { jsonrpc?: unknown; id?: unknown; method?: unknown };
+  const text = new TextDecoder().decode(bytes);
+  try { message = JSON.parse(text); } catch { return withCORS(json(400, { error: 'invalid_request' })); }
+  // A key given twice could mean two things to two readers, so such a body is refused.
+  if (!isPlain(message) || message.jsonrpc !== '2.0' || typeof message.method !== 'string' || doorRepeatsKey(text)) return withCORS(json(400, { error: 'invalid_request' }));
+  const call = { id: message.id, method: message.method };
+  if (!DOOR_METHODS.includes(message.method)) {
+    if (!Object.hasOwn(message, 'id')) return withCORS(new Response(null, { status: 202 }));
+    return withCORS(json(200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32601, message: 'This method is not available through the door.' } }));
+  }
+  const subscription = await (seams.subscription ?? doorSubscription)(claims);
+  if (!subscription.ok) return withCORS(doorRefusal(call, 'subscription', subscription.message));
+  const headers = new Headers();
+  for (const name of DOOR_FORWARDED) { const value = request.headers.get(name); if (value) headers.set(name, value); }
+  let reply: Response;
+  try {
+    reply = await fetchImpl(config.upstream, { method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(TIMEOUT_MS), body: bytes, headers });
+  } catch { return withCORS(doorRefusal(call, 'not_reachable', 'The service behind this connection did not answer. Try again shortly.')); }
+  // A redirect is never followed: the token would travel with it.
+  if (reply.status >= 300 && reply.status < 400) {
+    void reply.body?.cancel().catch(() => {});
+    return withCORS(doorRefusal(call, 'not_reachable', 'The service behind this connection did not answer. Try again shortly.'));
+  }
+  const back = new Headers();
+  for (const name of DOOR_RETURNED) { const value = reply.headers.get(name); if (value !== null) back.set(name, value); }
+  return withCORS(new Response(reply.body, { status: reply.status, headers: back }));
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const origin = relayOrigin(env);
@@ -354,6 +599,11 @@ export default {
     }
     // OAuth discovery for chat apps: public, and readable from browsers.
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+    if (url.pathname === DOOR_METADATA_PATH || url.pathname === DOOR_PATH) {
+      const door = doorConfig(env, origin);
+      if (door && url.pathname === DOOR_METADATA_PATH) return withCORS(json(200, doorMetadata(origin, door)));
+      if (door) return handleDoor(request, env, origin, door);
+    }
     if (['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp'].includes(url.pathname)) {
       return withCORS(json(200, protectedResourceMetadata(origin)));
     }
@@ -408,7 +658,7 @@ export class Tunnel extends DurableObject<Env> {
   private reading = 0;
   private oauthReading = 0;
   private next = 0;
-  private rates = new Map<string, { minute: number; count: number }>();
+  protected rates = new Map<string, { minute: number; count: number }>();
   private hostedRunning = false;
   /// Set when a device connects; tests may set it directly. Routing re-checks live sockets.
   activeSocket: WebSocket | null;
@@ -1258,6 +1508,7 @@ export class Codes extends DurableObject<Env> {
 
 export class Gateway extends Tunnel {
   protected override universal = true;
+  private doorPruned = -1;
 
   /// Internal RPC: no body, device calls, or public route. Fetch validates again
   /// after admission so expiry/revocation between these steps cannot authorize it.
@@ -1266,6 +1517,18 @@ export class Gateway extends Tunnel {
     if (this.limited(`admission:${address}`, ADDRESS_PER_MINUTE)) return { status: 429 };
     const identity = await this.chatIdentity(new Request(`${this.origin()}/mcp`, { headers: { authorization } }), '');
     return identity instanceof Response ? { status: identity.status, description: 'Connect this app to your Marginalia library, or reconnect if access expired or was revoked.' } : { status: 200 };
+  }
+
+  /// Internal RPC for the door: counts one call in memory (no body, no storage) and says whether it may go on.
+  async admitDoor(key: string, limit: number): Promise<boolean> {
+    const minute = Math.floor(Date.now() / 60_000);
+    // Past the cap, old entries are dropped at most once a minute; if it is still full, a new key is refused.
+    if (this.rates.size >= 5000 && this.doorPruned !== minute) {
+      this.doorPruned = minute;
+      for (const [name, entry] of this.rates) if (entry.minute !== minute) this.rates.delete(name);
+    }
+    if (this.rates.size >= 5000 && !this.rates.has(key)) return false;
+    return !this.limited(key, limit);
   }
 
   override async fetch(request: Request): Promise<Response> {

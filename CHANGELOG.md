@@ -2,6 +2,7 @@
 
 ## Unreleased developer preview
 
+- Added the door, an off-by-default pass-through MCP address at `/door/mcp` for staging.
 - Extracted the existing relay and Node bridge into a clean standalone history.
 - Added configurable origin, sample-only deployment, package exports/types and
   external tarball checks.

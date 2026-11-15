@@ -40,7 +40,7 @@
     "dev": "wrangler dev --ip 127.0.0.1 --port 8787",
     "build": "wrangler types && tsc -p tsconfig.build.json && node ../../scripts/finalize-worker.mjs",
     "typecheck": "wrangler types && tsc --noEmit -p tsconfig.json",
-    "test": "node --test src/index.test.js",
+    "test": "node --test src/index.test.js src/door.test.js",
     "prepack": "npm run build"
   }
 }

@@ -57,6 +57,22 @@ Apple wake needs your own `APNS_TEAM_ID`, `APNS_TOPIC`, `APNS_KEY_ID` and
 No Apple production identity is supplied. Optional Directory verification uses
 the `OPENAI_APPS_CHALLENGE` secret; it is unrelated to OAuth.
 
+## The door (staging only)
+
+The door is a pass-through MCP address at `/door/mcp`. A chat app holds a token
+issued by an external identity service; the door checks it and forwards the call
+to one upstream MCP address. It is off unless these public vars are all set and
+valid:
+
+- `DOOR_ISSUER`: the identity service origin, for example `https://id.example.com`.
+- `DOOR_JWKS_URL`: its published keys address, on the same origin.
+- `DOOR_UPSTREAM_MCP`: the one upstream MCP address.
+- `DOOR_SCOPES` (optional): up to eight space-separated scope names to publish.
+
+It needs no secret and no storage. Keep the vars out of production config and out
+of `wrangler.toml`; the sample lists them commented out. Metadata is at
+`/.well-known/oauth-protected-resource/door/mcp`.
+
 ## Acceptance and operation
 
 Verify health/discovery at your origin, approve a synthetic device, connect the
