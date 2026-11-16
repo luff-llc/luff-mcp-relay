@@ -57,13 +57,15 @@ zero knowledge. Durable Object storage is operated by the hosting provider.
 
 ## The door
 
-On staging, the door (`/door/mcp`) passes a chat app's MCP calls to one configured
+The door (`/door/mcp`) passes a chat app's MCP calls to one configured
 upstream after checking the token that app holds from an external identity service.
 The operator can read those calls while they pass through, and the upstream's
 answers coming back. The door holds no credential and stores nothing about the
 calls: no database writes, no logs. Only in-memory rate counters exist. The
 upstream gets the same `Authorization` header and decides what each tool may do;
 the door has no tool list of its own.
+The door is meant for staging. That is the operator's choice: the code does not enforce it, and the door is on wherever its three variables are set.
+`GET` and `DELETE` on `/door/mcp` answer 405. Addresses are counted per IPv6 /64.
 The door does not forward client-sent JSON-RPC responses, so upstream elicitation and sampling are not available through it, and an upstream stream is cut at 30 seconds.
 
 ## Availability, revocation and retries

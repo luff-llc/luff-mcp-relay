@@ -400,7 +400,8 @@ export function resetDoorKeys(): void { doorKeys = null; }
 
 async function loadDoorKeys(url: string, fetchImpl: typeof fetch): Promise<Map<string, CryptoKey> | null> {
   try {
-    const response = await fetchImpl(url, { redirect: 'error', signal: AbortSignal.timeout(DOOR_JWKS_TIMEOUT_MS), headers: { accept: 'application/json' } });
+    // Only 200 counts: a redirect (3xx, or the opaque status 0 some runtimes give) is never followed and loads nothing.
+    const response = await fetchImpl(url, { redirect: 'manual', signal: AbortSignal.timeout(DOOR_JWKS_TIMEOUT_MS), headers: { accept: 'application/json' } });
     if (response.status !== 200 || !/^application\/(?:[\w.+-]+\+)?json\s*(?:;|$)/i.test(response.headers.get('content-type') ?? '')
       || Number(response.headers.get('content-length') ?? '0') > DOOR_JWKS_MAX) { void response.body?.cancel().catch(() => {}); return null; }
     const reader = response.body?.getReader();
@@ -432,22 +433,40 @@ async function loadDoorKeys(url: string, fetchImpl: typeof fetch): Promise<Map<s
   } catch { return null; }
 }
 
-/// The key for `kid`: null when the service publishes no such key, 'unavailable' when no keys can be had.
+/// The key for `kid`: null when the service publishes no such key, 'unavailable' when no keys can be had
+/// (or when the key is missing but a refetch is not yet allowed, so a rotated key is not called a bad token).
 async function doorKey(url: string, kid: string, fetchImpl: typeof fetch, now: number): Promise<CryptoKey | null | 'unavailable'> {
   if (!doorKeys || doorKeys.url !== url) doorKeys = { url, keys: null, at: 0, attempt: -Infinity, loading: 0 };
   const held = doorKeys;
   const fresh = held.keys !== null && now - held.at < DOOR_KEYS_FRESH_MS;
-  // Each request fetches for itself (another request's I/O is never awaited); the minute limit counts from the start.
-  // With no keys yet and a first fetch still under way, a second request fetches too, so a cold start refuses nobody.
+  let fetched = false;
+  // Each request fetches for itself: a Worker must not await a promise that belongs to another request, which may be
+  // cancelled and never settle. With no keys yet and a first fetch under way, a second request fetches too.
   if ((!fresh || !held.keys?.has(kid)) && (now - held.attempt >= DOOR_REFETCH_MS || (held.keys === null && held.loading > 0))) {
     held.attempt = now;
     held.loading++;
     let keys: Map<string, CryptoKey> | null;
     try { keys = await loadDoorKeys(url, fetchImpl); } finally { held.loading--; }
-    if (keys) { held.keys = keys; held.at = now; }
+    // A slower, older fetch never replaces keys from a later one.
+    if (keys && now >= held.at) { held.keys = keys; held.at = now; }
+    fetched = true;
   }
   if (!held.keys || now - held.at >= DOOR_KEYS_FRESH_MS + DOOR_KEYS_GRACE_MS) return 'unavailable';
-  return held.keys.get(kid) ?? null;
+  return held.keys.get(kid) ?? (fetched ? null : 'unavailable');
+}
+
+/// What the address limit counts: an IPv4 address as it is, an IPv6 address by its /64 (first four groups); the raw text if it does not parse.
+function doorAddress(raw: string): string {
+  if (!raw.includes(':') || raw.includes('.') || raw.includes('%')) return raw;
+  const halves = raw.split('::');
+  if (halves.length > 2) return raw;
+  const side = (text: string) => (text === '' ? [] : text.split(':'));
+  const head = side(halves[0]), tail = halves.length === 2 ? side(halves[1]) : [];
+  const gap = 8 - head.length - tail.length;
+  if (halves.length === 2 ? gap < 1 : gap !== 0) return raw;
+  const groups = [...head, ...Array<string>(halves.length === 2 ? gap : 0).fill('0'), ...tail];
+  if (groups.some(group => !/^[0-9a-f]{1,4}$/i.test(group))) return raw;
+  return `${groups.slice(0, 4).map(group => parseInt(group, 16).toString(16)).join(':')}::/64`;
 }
 
 const isPlain = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -526,7 +545,7 @@ export async function handleDoor(request: Request, env: Env, origin: string, con
   // The rate-limit instance is separate from the library's, and only counts in memory.
   const limiter = env.GATEWAY.get(env.GATEWAY.idFromName('door'));
   const tooMany = () => { leave(); return withCORS(error(429, 'rate_limited', 'Too many requests; wait a minute.')); };
-  if (!await limiter.admitDoor(`address:${request.headers.get('cf-connecting-ip') ?? 'unknown'}`, ADDRESS_PER_MINUTE)) return tooMany();
+  if (!await limiter.admitDoor(`address:${doorAddress(request.headers.get('cf-connecting-ip') ?? 'unknown')}`, ADDRESS_PER_MINUTE)) return tooMany();
   const authorization = request.headers.get('authorization');
   const refuseToken = () => {
     leave();
@@ -551,8 +570,9 @@ export async function handleDoor(request: Request, env: Env, origin: string, con
   if (bytes === null) return withCORS(error(413, 'payload_too_large', 'Request too large.'));
   // The body is read only to look at it; the original bytes are what travel on.
   let message: { jsonrpc?: unknown; id?: unknown; method?: unknown };
-  const text = new TextDecoder().decode(bytes);
-  try { message = JSON.parse(text); } catch { return withCORS(json(400, { error: 'invalid_request' })); }
+  let text: string;
+  // Invalid UTF-8 or a leading byte-order mark is refused like any unreadable body (ignoreBOM keeps the mark, so parsing fails).
+  try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes); message = JSON.parse(text); } catch { return withCORS(json(400, { error: 'invalid_request' })); }
   // A key given twice could mean two things to two readers, so such a body is refused.
   if (!isPlain(message) || message.jsonrpc !== '2.0' || typeof message.method !== 'string' || doorRepeatsKey(text)) return withCORS(json(400, { error: 'invalid_request' }));
   const call = { id: message.id, method: message.method };
@@ -1522,12 +1542,14 @@ export class Gateway extends Tunnel {
   /// Internal RPC for the door: counts one call in memory (no body, no storage) and says whether it may go on.
   async admitDoor(key: string, limit: number): Promise<boolean> {
     const minute = Math.floor(Date.now() / 60_000);
-    // Past the cap, old entries are dropped at most once a minute; if it is still full, a new key is refused.
-    if (this.rates.size >= 5000 && this.doorPruned !== minute) {
-      this.doorPruned = minute;
-      for (const [name, entry] of this.rates) if (entry.minute !== minute) this.rates.delete(name);
+    // At the cap a new key makes room and is admitted: earlier minutes go (scanned at most once a minute), then the oldest entries.
+    if (this.rates.size >= 5000 && !this.rates.has(key)) {
+      if (this.doorPruned !== minute) {
+        this.doorPruned = minute;
+        for (const [name, entry] of this.rates) if (entry.minute !== minute) this.rates.delete(name);
+      }
+      for (const name of this.rates.keys()) { if (this.rates.size < 5000) break; this.rates.delete(name); }
     }
-    if (this.rates.size >= 5000 && !this.rates.has(key)) return false;
     return !this.limited(key, limit);
   }
 

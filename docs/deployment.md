@@ -69,9 +69,12 @@ valid:
 - `DOOR_UPSTREAM_MCP`: the one upstream MCP address.
 - `DOOR_SCOPES` (optional): up to eight space-separated scope names to publish.
 
-It needs no secret and no storage. Keep the vars out of production config and out
+It needs no secret and no storage. The door is meant for staging only. That is the
+operator's choice: the code does not enforce it, and the door is on wherever its three
+variables are set. Keep the vars out of production config and out
 of `wrangler.toml`; the sample lists them commented out. Metadata is at
-`/.well-known/oauth-protected-resource/door/mcp`.
+`/.well-known/oauth-protected-resource/door/mcp`. `GET` and `DELETE` on `/door/mcp`
+answer 405. Addresses are counted per IPv6 /64.
 
 ## A staging Worker from this repository
 
